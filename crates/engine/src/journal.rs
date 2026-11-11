@@ -83,6 +83,16 @@ pub struct Taken {
     pub cut: bool,
 }
 
+/// Where the log had got to, so a caller that runs commands and then takes them back without a
+/// trace can take them back out of the log too (`Session::edit_snapshot` / `Session::restore`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mark {
+    entries: usize,
+    /// The steps in the last entry the mark leaves, so a command that joined it is dropped too.
+    steps: usize,
+    cut: bool,
+}
+
 /// Whether the command about to run belongs with the last entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Joins {
@@ -152,9 +162,12 @@ impl Journal {
     }
 
     /// The commands cannot be replayed from the start of the log any more: undo, redo, repeat, or
-    /// an edit that is not a step. The next [`Self::take`] reports a cut once.
+    /// an edit that is not a step. The next [`Self::take`] reports a cut once, and drops the steps
+    /// with it.
+    ///
+    /// The entries stay until that take, so a caller that takes a command back out of the document
+    /// (`Session::restore`) can rewind the cut away along with it.
     pub(crate) fn cut(&mut self) {
-        self.clear();
         self.cut = true;
     }
 
@@ -163,6 +176,22 @@ impl Journal {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.cut = false;
+    }
+
+    /// The log's position now, for [`Self::rewind`].
+    pub(crate) fn mark(&self) -> Mark {
+        Mark { entries: self.entries.len(), steps: self.entries.last().map_or(0, |entry| entry.steps.len()), cut: self.cut }
+    }
+
+    /// Drops what was recorded after `mark` and puts the cut flag back: the caller took the
+    /// commands' effects out of the document (`Session::restore`), so they must not travel.
+    pub(crate) fn rewind(&mut self, mark: Mark) {
+        let Mark { entries, steps, cut } = mark;
+        self.entries.truncate(entries);
+        if let Some(entry) = self.entries.last_mut() {
+            entry.steps.truncate(steps);
+        }
+        self.cut = cut;
     }
 
     /// How many entries the log holds (the number [`JOURNAL_MAX`] counts).
@@ -375,6 +404,25 @@ mod tests {
         assert_eq!(para.props_of_char(0).bold, Some(true));
         assert_eq!(para.props_of_char(0).italic, None);
         assert_eq!(reader.pending.as_ref().and_then(|p| p.italic), Some(true));
+    }
+
+    /// A dialog that runs its commands as one step and puts the document back when one fails
+    /// (`Session::restore`) must not leave them in the log: the other client would run edits the
+    /// author no longer has (0032 決定 6).
+    #[test]
+    fn restoring_a_snapshot_takes_the_commands_back_out_of_the_log() {
+        let mut s = session("");
+        s.run("text.insert", &json!({"text": "a"})).unwrap();
+        let snapshot = s.edit_snapshot();
+
+        s.run("text.insert", &json!({"text": "b"})).unwrap();
+        s.run("insert.pageBreak", &json!({})).unwrap();
+        s.restore(snapshot);
+
+        let taken = s.take_journal();
+        assert!(!taken.cut, "the commands were taken back, so nothing needs a base");
+        assert_eq!(ids(&taken), ["text.insert"], "only the keystroke before the snapshot is left");
+        assert_eq!(s.doc.plain_text(StoryRef::Body), "a");
     }
 
     #[test]

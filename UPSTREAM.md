@@ -36,7 +36,7 @@ fork。bace（[`crcrworks/bace`](https://github.com/crcrworks/bace)）が LiveWi
 | `crates/engine/src/journal.rs` | **新しいモジュール。** セッションが実行したコマンドの記録（journal）と、それを別のセッションで実行し直す `Session::apply_journal`。bace 側の設計は [`0032-wordcraft-journal.md`](https://github.com/crcrworks/bace/blob/main/docs/decisions/0032-wordcraft-journal.md) | — |
 | `crates/engine/src/lib.rs` | `CommandSpec` に `journal` を足し、モジュールを公開するフック | 4 |
 | `crates/engine/src/cmd/mod.rs` | テキスト・書式・段落の編集コマンドを journal 対象にするフック | 4 |
-| `crates/engine/src/session.rs` | `run` の成功時に journal へ記録するフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 11 |
+| `crates/engine/src/session.rs` | `run` の成功時に journal へ記録するフック、`restore` で記録を巻き戻すフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 12 |
 
 2026-11-11 時点（`bace` の起点）のコードの差分はゼロだった。journal を足した時点で:
 

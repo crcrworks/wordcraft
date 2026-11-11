@@ -309,6 +309,8 @@ pub struct EditSnapshot {
     typing_open: bool,
     join_next: bool,
     dirty: bool,
+    /// Where the journal had got to: commands run since are not the document's history.
+    journal: crate::journal::Mark,
 }
 
 /// Undo steps that the commands run between [`Session::edit_snapshot`] and [`Session::restore`]
@@ -1117,9 +1119,9 @@ impl Session {
             ui_requests: _,
             document_id: _,
             // bace: journal
-            // What a host sends to another session instead of the document, not an edit to this
-            // one; and whether those steps are being replayed right now.
-            journal: _,
+            // What a host sends to another session instead of the document: a snapshot puts the
+            // log back to where it was, and steps being replayed right now are not part of it.
+            journal,
             applying: _,
             read_aloud: _,
             prefs: _,
@@ -1157,6 +1159,7 @@ impl Session {
             typing_open: *typing_open,
             join_next: *join_next,
             dirty: *dirty,
+            journal: journal.mark(),
         }
     }
 
@@ -1164,7 +1167,7 @@ impl Session {
     /// selection or undo/redo (undo steps the limit pushed out meanwhile come back). The layout
     /// is recomputed.
     pub fn restore(&mut self, snap: EditSnapshot) {
-        let EditSnapshot { doc, sel, history_len, evicted, head, redo, typing_open, join_next, dirty } = snap;
+        let EditSnapshot { doc, sel, history_len, evicted, head, redo, typing_open, join_next, dirty, journal } = snap;
         let gone = usize::try_from(self.undo_evicted.saturating_sub(evicted)).unwrap_or(usize::MAX);
         if gone > 0 {
             let back = gone.min(head.len());
@@ -1178,6 +1181,8 @@ impl Session {
         self.redo = redo;
         self.typing_open = typing_open;
         self.join_next = join_next;
+        // bace: journal; the commands taken back must not travel to another session.
+        self.journal.rewind(journal);
         self.touch();
         self.dirty = dirty;
     }
