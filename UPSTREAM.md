@@ -30,15 +30,19 @@ fork。bace（[`crcrworks/bace`](https://github.com/crcrworks/bace)）が LiveWi
 
 `bace` が上流と違うファイル。merge のたびに更新する。
 
-| ファイル | 理由 |
-| --- | --- |
-| `UPSTREAM.md` | この文書。コードの差分ではない |
+| ファイル | 理由 | `// bace:` |
+| --- | --- | --- |
+| `UPSTREAM.md` | この文書。コードの差分ではない | — |
+| `crates/engine/src/journal.rs` | **新しいモジュール。** セッションが実行したコマンドの記録（journal）と、それを別のセッションで実行し直す `Session::apply_journal`。bace 側の設計は [`0032-wordcraft-journal.md`](https://github.com/crcrworks/bace/blob/main/docs/decisions/0032-wordcraft-journal.md) | — |
+| `crates/engine/src/lib.rs` | `CommandSpec` に `journal` を足し、モジュールを公開するフック | 4 |
+| `crates/engine/src/cmd/mod.rs` | テキスト・書式・段落の編集コマンドを journal 対象にするフック | 4 |
+| `crates/engine/src/session.rs` | `run` の成功時に journal へ記録するフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 11 |
 
-2026-11-11 時点（`bace` の起点）で、コードの差分は**ゼロ**:
+2026-11-11 時点（`bace` の起点）のコードの差分はゼロだった。journal を足した時点で:
 
 ```bash
-git diff eae242176108d328c5dd81fbc10370c51ab90706 bace -- . ':!UPSTREAM.md'   # 空
-git grep -c '// bace:' bace -- . ':!UPSTREAM.md'                              # 何も出ない
+git diff eae242176108d328c5dd81fbc10370c51ab90706 bace --stat
+git grep -c '// bace:'
 ```
 
 ## 既存ファイルへの変更はフックだけにする

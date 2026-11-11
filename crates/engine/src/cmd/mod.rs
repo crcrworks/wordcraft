@@ -53,20 +53,20 @@ use serde_json::{Value, json};
 use wordcraft_doc::props::CharProps;
 use wordcraft_doc::{Pos, Revision, RevisionKind, StoryRef};
 
-use crate::{CmdError, CmdResult, Registry, Session};
+use crate::{CmdError, CmdResult, CommandSpec, Registry, Session};
 
 /// The full registry.
 pub fn registry() -> Registry {
     let mut v = Vec::new();
-    v.extend(text::specs());
+    v.extend(journaled(text::specs())); // bace: journal
     v.extend(caret::specs());
     v.extend(column::specs());
     v.extend(edit::specs());
     v.extend(paste::specs());
-    v.extend(format::specs());
+    v.extend(journaled(format::specs())); // bace: journal
     v.extend(font::specs());
     v.extend(phonetic::specs());
-    v.extend(para::specs());
+    v.extend(journaled(para::specs())); // bace: journal
     v.extend(lists::specs());
     v.extend(inspector::specs());
     v.extend(view::specs());
@@ -101,6 +101,22 @@ pub fn registry() -> Registry {
     v.extend(speech::specs());
     v.extend(controls::specs());
     Registry::new(v)
+}
+
+// bace: mark a module's edits as ones a host can replay elsewhere.
+/// Marks every mutating command of a module as one a journaled edit can be
+/// ([`CommandSpec::journal`]).
+///
+/// Used for the modules whose commands are a change to the text or its formatting at the
+/// selection: the params and the state recorded with them describe the edit fully
+/// (`crate::journal`). Everything else — tables, equations, pictures, page setup, printing, the
+/// view, the clipboard — stays out, and running one **cuts** the log so the host sends the
+/// document as the next base instead.
+fn journaled(mut specs: Vec<CommandSpec>) -> Vec<CommandSpec> {
+    for spec in &mut specs {
+        spec.journal = spec.mutates;
+    }
+    specs
 }
 
 /// A shortcut that differs on macOS, where Word for Mac moves it (⌘Q quits, ⌘Space is

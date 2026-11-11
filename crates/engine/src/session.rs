@@ -23,6 +23,7 @@ use wordcraft_doc::props::CharProps;
 use wordcraft_doc::{Document, Path, Pos, StoryRef, Table};
 use wordcraft_layout::{DocLayout, LayoutCache, LayoutOptions, NumeralMode, ViewMode};
 
+use crate::journal::Joins; // bace: journal
 use crate::{CmdError, Registry};
 
 /// A selection: anchor (where it started) and focus (where the caret is).
@@ -388,6 +389,13 @@ pub struct Session {
     /// Which document this is: changes when [`Session::set_document`] replaces it (open, new,
     /// mail merge, recover), never on an edit.
     document_id: u64,
+    // bace: journal
+    /// The commands this session ran, for a host that sends them to another session instead of
+    /// the document ([`crate::journal`]). Not part of the document or its history.
+    journal: crate::journal::Journal,
+    /// Set while [`Session::apply_journal`] runs steps another session recorded: they are not
+    /// journaled and do not cut the log.
+    applying: bool,
     cache: LayoutCache,
     /// (revision, width, read height, view, read line spacing, layout, proofing, outline,
     /// (deletions left out, body deletions in balloons), numeral display).
@@ -572,6 +580,33 @@ const MAX_UNDO: usize = 500;
 /// How many steps the Undo button's list shows (#701); `edit.undoTo` reaches no further.
 pub const UNDO_LIST_MAX: usize = 100;
 
+// bace: the state a command read, for the journal.
+/// The state a command is about to read, captured by [`Session::run`] for
+/// [`Session::note_journal`] (`crate::journal`).
+struct JournalBefore {
+    sel: Selection,
+    pending: Option<CharProps>,
+    rev: u64,
+    document: u64,
+    /// The command reads a column block, whole table cells, an equation being edited or extra
+    /// selected objects: state a step cannot carry, so the log is cut instead of recording it.
+    blocked: bool,
+}
+
+// bace: what replaying another session's steps must leave alone.
+/// The session's own editing state, which [`Session::apply_journal`] puts back afterwards: another
+/// session's steps move the selection and set the pending formatting to replay their edits there.
+struct OwnState {
+    sel: Selection,
+    pending: Option<CharProps>,
+    also_selected: Vec<Pos>,
+    goal_x: Option<f32>,
+    typing_open: bool,
+    join_next: bool,
+    edit_marks: Vec<Pos>,
+    go_back_step: usize,
+}
+
 impl Session {
     /// File name of the persisted custom dictionary inside the settings folder.
     pub const USER_DICT_FILE: &str = "custom-dictionary.txt";
@@ -620,6 +655,8 @@ impl Session {
             join_next: false,
             rev: 1,
             document_id: 1,
+            journal: crate::journal::Journal::default(), // bace: journal
+            applying: false,
             cache: LayoutCache::new(),
             layout: None,
             originals: Default::default(),
@@ -1079,6 +1116,11 @@ impl Session {
             merge: _,
             ui_requests: _,
             document_id: _,
+            // bace: journal
+            // What a host sends to another session instead of the document, not an edit to this
+            // one; and whether those steps are being replayed right now.
+            journal: _,
+            applying: _,
             read_aloud: _,
             prefs: _,
             system_region: _,
@@ -1193,6 +1235,10 @@ impl Session {
         if spec.mutates && !matches!(id, "edit.undo" | "edit.redo" | "edit.repeat") {
             self.last_command = Some((id.to_string(), kept()));
         }
+        // bace: journal; a journaled step carries the selection and the pending formatting and nothing else
+        // (`crate::journal`): an edit that reads a block, whole cells, an equation or extra
+        // objects cuts the log instead of being recorded.
+        let journal_blocked = self.column.is_some() || self.widened.is_some() || self.math.is_some() || !self.also_selected.is_empty();
         // Typing, caret movement and selection outside the equation commands leave the equation.
         if self.math.is_some()
             && (id.starts_with("text.") || id.starts_with("caret.") || id.starts_with("select.") || id.starts_with("edit.paste"))
@@ -1201,6 +1247,16 @@ impl Session {
             let off = m.at.off + wordcraft_doc::para::OBJ.len_utf8();
             self.sel = Selection::caret(Pos { off, ..m.at });
         }
+        // bace: journal the run's commands in one entry.
+        // Whether the command is a keystroke of a typing run or a later frame of a drag, so the
+        // journal keeps one entry for the run (`crate::journal`).
+        let joins = if spec.mutates && matches!(id, "text.insert" | "equation.type") {
+            Joins::Typing
+        } else if join && spec.mutates {
+            Joins::Drag
+        } else {
+            Joins::No
+        };
         // The undo stacks are snapshotted whole, not as a length: commands run nested commands,
         // whose checkpoints, undos and redos (and evictions at the limit) must be put back too.
         let before_doc = if spec.mutates {
@@ -1235,6 +1291,14 @@ impl Session {
         {
             self.pending_move = None;
         }
+        // bace: journal
+        let journal_before = JournalBefore {
+            sel: self.sel.clone(),
+            pending: self.pending.clone(),
+            rev: self.rev,
+            document: self.document_id,
+            blocked: journal_blocked,
+        };
         let sel_before = self.sel.clone();
         let run = spec.run;
         let mutates = spec.mutates;
@@ -1284,6 +1348,7 @@ impl Session {
                 if !matches!(id, "select.addObject" | "arrange.ungroup") && (spec.mutates || self.sel != sel_before) {
                     self.also_selected.clear();
                 }
+                self.note_journal(id, params, spec.journal, joins, journal_before); // bace: journal
             }
             Err(e) => {
                 if let Some((d, s, h, r, t, ev, c)) = before_doc {
@@ -1300,6 +1365,125 @@ impl Session {
             }
         }
         result
+    }
+
+    // bace: the journal API a host mirrors the document with.
+    /// What the session journaled since the last call, for a host that sends it to another session
+    /// (`crate::journal`). A cut means the log lost its beginning: the host has to offer the
+    /// document as the new base instead.
+    pub fn take_journal(&mut self) -> crate::journal::Taken {
+        self.journal.take()
+    }
+
+    /// The steps are inside a document the host is offering as the log's next base: forget them
+    /// rather than sending them twice.
+    pub fn skip_journal(&mut self) {
+        self.journal.clear();
+    }
+
+    /// How many entries the journal holds (one per typing run or drag), for traces and tests.
+    pub fn journal_entries(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Runs the steps another session journaled (`crate::journal`), in order.
+    ///
+    /// Each is a command, preceded by a `journal.state` step with the selection and the formatting
+    /// waiting at the caret that session had, so the command edits the same place. The person's
+    /// own caret, pending formatting and extra selection are put back afterwards, and nothing run
+    /// here is journaled in turn: two sessions can send each other's steps without echoing them.
+    /// Returns how many commands ran (one the document refuses is skipped, as a step from another
+    /// version would be).
+    pub fn apply_journal(&mut self, steps: &[(String, Value)]) -> usize {
+        let own = self.own_state();
+        self.applying = true;
+        let mut applied = 0;
+        for (id, params) in steps {
+            if id == crate::journal::STATE {
+                self.apply_journal_state(params);
+                continue;
+            }
+            match self.run(id, params) {
+                Ok(_) => applied += 1,
+                Err(error) => log::warn!("a journaled {id} was not applied: {error}"),
+            }
+        }
+        self.applying = false;
+        self.restore_own_state(own);
+        applied
+    }
+
+    /// The state the person here is editing with, which replaying another session's steps must
+    /// leave as it found it.
+    fn own_state(&self) -> OwnState {
+        OwnState {
+            sel: self.sel.clone(),
+            pending: self.pending.clone(),
+            also_selected: self.also_selected.clone(),
+            goal_x: self.goal_x,
+            typing_open: self.typing_open,
+            join_next: self.join_next,
+            edit_marks: self.edit_marks.clone(),
+            go_back_step: self.go_back_step,
+        }
+    }
+
+    /// Puts [`Session::own_state`] back.
+    fn restore_own_state(&mut self, own: OwnState) {
+        let OwnState { sel, pending, also_selected, goal_x, typing_open, join_next, edit_marks, go_back_step } = own;
+        self.sel = sel;
+        self.pending = pending;
+        self.also_selected = also_selected;
+        self.goal_x = goal_x;
+        self.typing_open = typing_open;
+        self.join_next = join_next;
+        self.edit_marks = edit_marks;
+        self.go_back_step = go_back_step;
+        self.clamp_selection();
+    }
+
+    /// Puts the selection and the formatting waiting at the caret back where the session that
+    /// journaled the next step had them (`crate::journal`).
+    ///
+    /// A column block, a whole-cell selection or an equation being edited here ends: the selection
+    /// is the plain one the other session had, so a block this document no longer matches cannot
+    /// make the step edit something else.
+    fn apply_journal_state(&mut self, params: &Value) {
+        if let (Some(anchor), Some(focus)) =
+            (params.get("anchor").and_then(crate::cmd::parse_pos), params.get("focus").and_then(crate::cmd::parse_pos))
+        {
+            self.sel = Selection { anchor: self.doc.clamp(&anchor), focus: self.doc.clamp(&focus) };
+            self.goal_x = None;
+        }
+        self.pending = match params.get("pending") {
+            Some(Value::Null) | None => None,
+            Some(props) => serde_json::from_value(props.clone()).ok(),
+        };
+        self.column = None;
+        self.widened = None;
+        self.math = None;
+    }
+
+    /// Records the command that just ran for the host's journal, or cuts the log when a step cannot
+    /// describe it (`crate::journal`): the command is not marked `journal`, or it read a column
+    /// block, whole table cells, an equation or extra selected objects.
+    fn note_journal(&mut self, id: &str, params: &Value, journaled: bool, joins: Joins, before: JournalBefore) {
+        // A step another session sent is replayed here: it is not journaled in turn.
+        if self.applying {
+            return;
+        }
+        // A command that changed nothing (a read, a view toggle, a dialog) is not an edit.
+        let replaced = self.document_id != before.document;
+        if !replaced && self.rev == before.rev {
+            return;
+        }
+        // A replaced document (open, new, mail merge, recover) is not an edit of the one the log
+        // describes: the host offers it as the log's next base.
+        if replaced || !journaled || before.blocked {
+            self.journal.cut();
+            return;
+        }
+        self.journal.record(id, params, &before.sel, before.pending.as_ref(), joins);
     }
 
     /// The paragraph path the caret is in.

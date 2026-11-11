@@ -11,6 +11,8 @@ pub mod cmd;
 pub mod file_access;
 pub mod io;
 mod io_ext;
+// bace: the journal a host mirrors this document through
+pub mod journal;
 pub mod keymap;
 pub mod math_gallery;
 pub mod print;
@@ -68,6 +70,12 @@ pub struct CommandSpec {
     /// Parameter description for agents (`{"size": number}`).
     pub params: &'static str,
     pub mutates: bool,
+    // bace: whether a host that mirrors the document elsewhere can replay this command there;
+    // the state it reads (the selection, the pending formatting) is recorded with it.
+    /// Whether a host that mirrors the document elsewhere can replay this command there
+    /// ([`journal`]): its params and the state it reads describe the edit fully. A command that
+    /// is not journaled cuts the log instead, and the host offers the document as its next base.
+    pub journal: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
     pub run: fn(&mut Session, &Value) -> CmdResult,
@@ -79,7 +87,7 @@ fn always(_: &Session) -> Option<&'static str> {
 
 impl CommandSpec {
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
-        CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run }
+        CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, journal: false, enabled: always, run } // bace: journal
     }
     pub const fn key(mut self, s: &'static str) -> Self {
         self.shortcut = s;
@@ -92,6 +100,16 @@ impl CommandSpec {
     /// Doesn't change the document (navigation, view, export).
     pub const fn pure(mut self) -> Self {
         self.mutates = false;
+        self
+    }
+    // bace: the builder for a single command a host can replay.
+    /// Records the command in the journal a host sends to another session ([`journal`]).
+    ///
+    /// Only a command whose params and the state it reads (the selection and the formatting
+    /// waiting at the caret) describe the edit fully can be one. When in doubt leave it off: an
+    /// unjournaled edit still reaches the other client, as the log's next base document.
+    pub const fn journal(mut self) -> Self {
+        self.journal = true;
         self
     }
     pub const fn when(mut self, f: fn(&Session) -> Option<&'static str>) -> Self {
