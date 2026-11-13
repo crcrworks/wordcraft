@@ -21,8 +21,11 @@ fork。bace（[`crcrworks/bace`](https://github.com/crcrworks/bace)）が LiveWi
 
 - `bace` の起点にした上流の rev: `eae242176108d328c5dd81fbc10370c51ab90706`
   (2026-10-15, "Merge pull request #2307 from dylanmtaylor/ci/nix-workflow")
-- `main` が mirror している上流の rev: `060768f1ed7f310e639bc49d7af7256e129f7409`
-  (2026-11-11, "Preserve header/footer content when adding page numbers (#2201)")
+- `main` が mirror している上流の rev: `fab8793ce791763761353b78caad6a63a46e5b01`
+  (2026-11-13, "Merge pull request #2703 from vangel76/feat/style-pr-change-2697")
+- `bace` が最後に取り込んだ上流の rev: `fab8793ce791763761353b78caad6a63a46e5b01`
+  (egui 0.37。上流が `crates/engine/src/session.rs` を `session/` のモジュールに分割したので、
+  journal のフックは分割後のモジュールに付け直した)
 
 `main` は bace のビルドには使わない。bace が使うのは `bace` だけ。
 
@@ -35,13 +38,26 @@ fork。bace（[`crcrworks/bace`](https://github.com/crcrworks/bace)）が LiveWi
 | `UPSTREAM.md` | この文書。コードの差分ではない | — |
 | `crates/engine/src/journal.rs` | **新しいモジュール。** セッションが実行したコマンドの記録（journal）と、それを別のセッションで実行し直す `Session::apply_journal`。bace 側の設計は [`0032-wordcraft-journal.md`](https://github.com/crcrworks/bace/blob/main/docs/decisions/0032-wordcraft-journal.md) | — |
 | `crates/engine/src/lib.rs` | `CommandSpec` に `journal` を足し、モジュールを公開するフック | 4 |
-| `crates/engine/src/cmd/mod.rs` | テキスト・書式・段落の編集コマンドを journal 対象にするフック | 4 |
-| `crates/engine/src/session.rs` | `run` の成功時に journal へ記録するフック、`restore` で記録を巻き戻すフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 12 |
+| `crates/engine/src/cmd.rs` | テキスト・書式・段落の編集コマンドを journal 対象にするフック（上流が `cmd/mod.rs` から改名） | 4 |
+| `crates/engine/src/session.rs` | `Session` に `journal` / `applying` を持つ | 1 |
+| `crates/engine/src/session/run.rs` | `run` の成功時に journal へ記録するフック、別の文書へ移ったコマンドでログを切るフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 9 |
+| `crates/engine/src/session/snapshot.rs` | `edit_snapshot` / `restore` で記録を巻き戻すフック | 3 |
+| `crates/engine/src/session/documents.rs` | 文書を切り替えたらログを切るフック（ログは表示中の文書のもの） | 2 |
+| `crates/engine/src/session/lifecycle.rs` | `Session::new` の初期化 | 1 |
+| `crates/engine/src/snapshot.rs` | `EditSnapshot` に journal の位置を持つ | 1 |
 
 2026-11-11 時点（`bace` の起点）のコードの差分はゼロだった。journal を足した時点で:
 
 ```bash
 git diff eae242176108d328c5dd81fbc10370c51ab90706 bace --stat
+git grep -c '// bace:'
+```
+
+`fab8793c`（egui 0.37）を取り込んだ時点の差は 9 ファイル・+690/−5、`// bace:` は 25 個。
+うち `crates/engine/src/session/*` の 16 個は、上流の `session.rs` 分割にフックを付け直したもの:
+
+```bash
+git diff fab8793ce791763761353b78caad6a63a46e5b01 bace --stat -- . ':!UPSTREAM.md'
 git grep -c '// bace:'
 ```
 
