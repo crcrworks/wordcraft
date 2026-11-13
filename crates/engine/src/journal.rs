@@ -5,8 +5,12 @@
 //! `crcrworks/bace`). Every user-visible edit is already a command, so the record of them is what
 //! travels: the host takes it here and the other session runs the same steps.
 //!
-//! This is **not** the undo history. Undo, redo and repeat are whole-document snapshots
-//! (`Session::history`), so a session cannot say which commands they correspond to. Running one
+//! This is **not** the undo history. Undo and redo are whole-document snapshots
+//! (`Session::history`), so a session cannot say which commands they correspond to. Their document
+//! change is sent as a [`REVERT`] step instead: the difference between the snapshot and the
+//! document, as block patches (see [`revert`]). Repeat is different: it re-runs the last command,
+//! and that command is journaled like any other. Undo of an edit no journaled command made — a
+//! table, an equation, a picture, page setup — has no such difference the log can carry, and
 //! **cuts** the log instead: the host takes a [`Taken`] with `cut` set, throws away what it had not
 //! sent, and offers the document itself as the log's next base. The same happens for an edit whose
 //! command is not marked [`journal`](crate::CommandSpec) (a table, a picture, a paste from the
@@ -31,11 +35,15 @@
 //! AutoFormat and AutoCorrect act per keystroke), so the steps stay as the session ran them and
 //! only the entry count stays small.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
 use crate::Selection;
 use crate::cmd::pos_json;
 use wordcraft_doc::props::CharProps;
+use wordcraft_doc::{Block, Document, StoryRef, Table};
 
 /// How many entries the log keeps before it drops the oldest.
 ///
@@ -50,6 +58,13 @@ pub const JOURNAL_DROP: usize = 5_000;
 /// at the caret (`{"anchor": Pos, "focus": Pos, "pending": CharProps | null}`). Not a command in
 /// the registry; [`Session::apply_journal`](crate::Session::apply_journal) takes it.
 pub const STATE: &str = "journal.state";
+
+/// The step Undo and Redo record instead of a command: block patches that take the document from
+/// the snapshot to the document the user sees now (`{"patches": [...]}`, see [`revert`]). Not a
+/// command in the registry; [`Session::apply_journal`](crate::Session::apply_journal) takes it.
+/// The patches are absolute changes to a story's blocks, not inverse commands: they do not read
+/// the selection, so the session that applies them keeps its own caret.
+pub const REVERT: &str = "journal.revert";
 
 /// One command as `Session::run` took it.
 #[derive(Clone, Debug, PartialEq)]
@@ -77,9 +92,9 @@ impl Step {
 pub struct Taken {
     /// The steps recorded since the last take, oldest first.
     pub steps: Vec<Step>,
-    /// The log cannot be replayed from its beginning any more (undo, a command that is not a
-    /// step, or the cap dropping the oldest entries). `steps` is empty and the host has to offer
-    /// the document as the log's new base.
+    /// The log cannot be replayed from its beginning any more (an undo the log cannot carry, a
+    /// command that is not a step, or the cap dropping the oldest entries). `steps` is empty and
+    /// the host has to offer the document as the log's new base.
     pub cut: bool,
 }
 
@@ -148,6 +163,16 @@ impl Journal {
         self.drop_past_cap();
     }
 
+    /// Records the patches that undo (or redo) made, in an entry of their own.
+    ///
+    /// A revert step is not a command and carries no state step: it names blocks by path and
+    /// index, so the session that applies it changes the same blocks and leaves its own caret
+    /// alone.
+    pub(crate) fn record_revert(&mut self, params: Value) {
+        self.entries.push(Entry { steps: vec![Step::new(REVERT, params)], open: Joins::No });
+        self.drop_past_cap();
+    }
+
     /// Takes everything recorded since the last call.
     ///
     /// A cut drops the steps as well: they are inside the document the host is about to offer as
@@ -161,9 +186,9 @@ impl Journal {
         Taken { steps, cut: false }
     }
 
-    /// The commands cannot be replayed from the start of the log any more: undo, redo, repeat, or
-    /// an edit that is not a step. The next [`Self::take`] reports a cut once, and drops the steps
-    /// with it.
+    /// The commands cannot be replayed from the start of the log any more: an undo whose document
+    /// change is not a patch (a table, an equation, a picture, page setup), or an edit that is not
+    /// a step. The next [`Self::take`] reports a cut once, and drops the steps with it.
     ///
     /// The entries stay until that take, so a caller that takes a command back out of the document
     /// (`Session::restore`) can rewind the cut away along with it.
@@ -214,6 +239,149 @@ impl Journal {
     }
 }
 
+/// The patches that take `from` to `to`, if the difference is one a journal can carry.
+///
+/// Undo and Redo move the document to a whole-document snapshot. Sending that snapshot
+/// would be a new base (`Taken::cut`), which makes the other client reopen the document and lose
+/// its undo history (`docs/decisions/0046-undo-as-differences.md` in `crcrworks/bace`). The
+/// difference between the two documents is usually small: typing changed one paragraph, formatting
+/// changed one paragraph's properties. This turns it into block patches.
+///
+/// `None` when the change is not just blocks: a table's shape or formatting, an equation, a
+/// picture's media, page setup, styles, comments or any other document property. Those edits are
+/// not journaled either (`CommandSpec.journal`), and Undo of them keeps the base fallback.
+///
+/// A patch is `{"story": StoryRef, "path": [u32], "at": n, "remove": n, "blocks": [Block]}`.
+/// `path` is the containing cell path (`[]` for a story, `[block, row, cell]` per table level),
+/// `at` and `remove` are an index and a count in that container, and `blocks` is what replaces
+/// them. The patches are ordered outermost first, so applying them in order reaches `to` even
+/// when an earlier patch changes a table another patch then edits.
+pub(crate) fn revert(from: &Document, to: &Document) -> Option<Value> {
+    if !same_outside_stories(from, to) {
+        return None;
+    }
+    let mut patches = Vec::new();
+    if !diff_blocks(&from.body, &to.body, 0, StoryRef::Body, &[], &mut patches) {
+        return None;
+    }
+    for id in from.parts.keys() {
+        let story = StoryRef::Part(*id);
+        let (Some(before), Some(after)) = (from.story(story), to.story(story)) else { return None };
+        if !diff_blocks(before, after, 0, story, &[], &mut patches) {
+            return None;
+        }
+    }
+    Some(json!({ "patches": patches }))
+}
+
+/// Whether every document field outside the stories' blocks is the same. The blocks are cleared
+/// in copies and compared by [`Document::same_content`], which lists every field, so a new field
+/// cannot silently become patchable.
+fn same_outside_stories(a: &Document, b: &Document) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.body.clear();
+    b.body.clear();
+    for part in a.parts.values_mut() {
+        part.blocks.clear();
+    }
+    for part in b.parts.values_mut() {
+        part.blocks.clear();
+    }
+    a.same_content(&b)
+}
+
+/// Appends the patches that turn `from` into `to`. `base` is where `from[0]` sits in the
+/// container, so a patch made after a split still names the right block. Returns false when a
+/// change is not a block patch (a table's shape, or a table block added or removed).
+fn diff_blocks(from: &[Arc<Block>], to: &[Arc<Block>], base: usize, story: StoryRef, path: &[u32], patches: &mut Vec<Value>) -> bool {
+    if from == to {
+        return true;
+    }
+    let shorter = from.len().min(to.len());
+    let mut prefix = 0;
+    while prefix < shorter && from[prefix] == to[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < shorter - prefix && from[from.len() - 1 - suffix] == to[to.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    let from = &from[prefix..from.len() - suffix];
+    let to = &to[prefix..to.len() - suffix];
+    let base = base + prefix;
+    if from.len() == to.len() {
+        let mut i = 0;
+        while i < from.len() {
+            match (&*from[i], &*to[i]) {
+                (Block::Para(_), Block::Para(_)) => {
+                    let start = i;
+                    i += 1;
+                    while i < from.len() && matches!((&*from[i], &*to[i]), (Block::Para(_), Block::Para(_))) {
+                        i += 1;
+                    }
+                    patches.push(patch(story, path, base + start, i - start, &to[start..i]));
+                }
+                (Block::Table(before), Block::Table(after)) => {
+                    if !same_table_shape(before, after) {
+                        return false;
+                    }
+                    for (row, (before, after)) in before.rows.iter().zip(&after.rows).enumerate() {
+                        for (cell, (before, after)) in before.cells.iter().zip(&after.cells).enumerate() {
+                            let mut cell_path = path.to_vec();
+                            cell_path.extend([(base + i) as u32, row as u32, cell as u32]);
+                            if !diff_blocks(&before.blocks, &after.blocks, 0, story, &cell_path, patches) {
+                                return false;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                _ => return false,
+            }
+        }
+        return true;
+    }
+    // The block count changed: a paragraph was split, merged, inserted or removed. An unchanged
+    // block (same allocation) inside the changed run is an anchor; the runs before and after it
+    // can be patches on their own. Without one, a table in the run would have to be added or
+    // removed, which a patch does not describe.
+    let mut anchors = HashMap::new();
+    for (index, block) in to.iter().enumerate() {
+        anchors.entry(Arc::as_ptr(block) as usize).or_insert(index);
+    }
+    if let Some((at, with)) = from.iter().enumerate().find_map(|(at, block)| anchors.get(&(Arc::as_ptr(block) as usize)).map(|with| (at, *with))) {
+        return diff_blocks(&from[..at], &to[..with], base, story, path, patches)
+            && diff_blocks(&from[at + 1..], &to[with + 1..], base + with + 1, story, path, patches);
+    }
+    if from.iter().chain(to).any(|block| matches!(&**block, Block::Table(_))) {
+        return false;
+    }
+    patches.push(patch(story, path, base, from.len(), to));
+    true
+}
+
+fn patch(story: StoryRef, path: &[u32], at: usize, remove: usize, blocks: &[Arc<Block>]) -> Value {
+    json!({ "story": story, "path": path, "at": at, "remove": remove, "blocks": blocks })
+}
+
+/// Whether two tables have the same shape and table/row/cell properties: the same rows and cells,
+/// with the same widths, merges, borders and controls. Only their cells' blocks may differ (that
+/// is what a patch can reach). Any other change — a column inserted, a row's height, a cell's
+/// span — is not a block patch.
+fn same_table_shape(a: &Table, b: &Table) -> bool {
+    a.props == b.props
+        && a.grid == b.grid
+        && a.controls == b.controls
+        && a.rows.len() == b.rows.len()
+        && a.rows.iter().zip(&b.rows).all(|(a, b)| {
+            a.props == b.props
+                && a.controls == b.controls
+                && a.cells.len() == b.cells.len()
+                && a.cells.iter().zip(&b.cells).all(|(a, b)| a.props == b.props && a.controls == b.controls)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +411,12 @@ mod tests {
     /// What a host sends: the steps as `(id, params)` pairs.
     fn pairs(s: &mut Session) -> Vec<(String, Value)> {
         s.take_journal().steps.into_iter().map(Step::into_pair).collect()
+    }
+
+    /// What the other session does with them; returns how many commands ran.
+    fn apply(s: &mut Session, taken: &Taken) -> usize {
+        let steps: Vec<(String, Value)> = taken.steps.iter().cloned().map(Step::into_pair).collect();
+        s.apply_journal(&steps)
     }
 
     #[test]
@@ -296,23 +470,145 @@ mod tests {
         assert_eq!(sizes, [json!(12), json!(14), json!(16)], "each frame is its own step: the last one wins when replayed");
     }
 
+    /// Undo and Redo no longer cut the log: the step they take is sent as the block
+    /// patches between the snapshot and the document, and the other session applies them. Its
+    /// own caret and undo stack are left alone, and the author still has the steps below the one
+    /// it undid.
     #[test]
-    fn undo_redo_and_repeat_cut_the_log() {
+    fn undo_and_redo_send_the_difference_and_keep_the_undo_stack() {
+        let mut author = session("");
+        let mut reader = session("");
+        author.run("text.insert", &json!({"text": "a"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("format.bold", &json!({})).unwrap();
+        author.run("text.insert", &json!({"text": "b"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 2);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "ab");
+        let depth = author.undo_depth();
+
+        author.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(author.undo_depth(), depth - 1);
+        assert!(author.can_undo(), "the steps below the one undone are still there");
+        let taken = author.take_journal();
+        assert!(!taken.cut);
+        assert_eq!(ids(&taken), [REVERT]);
+        assert_eq!(apply(&mut reader, &taken), 1);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "a");
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), author.doc.plain_text(StoryRef::Body));
+
+        // The next step only changed the pending formatting: no block, so nothing travels and
+        // no base is asked for.
+        author.run("edit.undo", &json!({})).unwrap();
+        let taken = author.take_journal();
+        assert!(!taken.cut);
+        assert!(taken.steps.is_empty());
+
+        author.run("edit.undo", &json!({})).unwrap();
+        let taken = author.take_journal();
+        assert!(!taken.cut);
+        assert_eq!(ids(&taken), [REVERT]);
+        assert_eq!(apply(&mut reader, &taken), 1);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "");
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), author.doc.plain_text(StoryRef::Body));
+
+        author.run("edit.redo", &json!({})).unwrap();
+        let taken = author.take_journal();
+        assert!(!taken.cut);
+        assert_eq!(ids(&taken), [REVERT]);
+        assert_eq!(apply(&mut reader, &taken), 1);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "a");
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), author.doc.plain_text(StoryRef::Body));
+    }
+
+    /// A paragraph split changes the number of blocks. Its undo merges them back, which is a
+    /// patch over a range of blocks, not a new base: the other session converges too.
+    #[test]
+    fn undo_of_a_paragraph_split_is_a_patch() {
+        let mut author = session("");
+        let mut reader = session("");
+        author.run("text.insert", &json!({"text": "a"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("text.newParagraph", &json!({})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("text.insert", &json!({"text": "b"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+
+        for _ in 0..3 {
+            author.run("edit.undo", &json!({})).unwrap();
+            let taken = author.take_journal();
+            assert!(!taken.cut);
+            if !taken.steps.is_empty() {
+                assert_eq!(ids(&taken), [REVERT]);
+                assert_eq!(apply(&mut reader, &taken), 1);
+            }
+            assert_eq!(reader.doc.plain_text(StoryRef::Body), author.doc.plain_text(StoryRef::Body));
+        }
+        assert_eq!(author.doc.plain_text(StoryRef::Body), "");
+    }
+
+    /// An undo that arrived is one step in the reader's own history, so its ⌘Z takes that undo
+    /// back and sends the inverse: the two sessions can undo and redo each other's work without
+    /// either becoming the other's base.
+    #[test]
+    fn a_received_undo_is_undoable_and_sends_the_inverse() {
+        let mut author = session("");
+        let mut reader = session("");
+        author.run("text.insert", &json!({"text": "a"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("format.bold", &json!({})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("text.insert", &json!({"text": "b"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        let depth = reader.undo_depth();
+
+        author.run("edit.undo", &json!({})).unwrap();
+        let taken = author.take_journal();
+        assert_eq!(apply(&mut reader, &taken), 1);
+        assert_eq!(reader.undo_depth(), depth + 1);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "a");
+
+        reader.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "ab");
+        let taken = reader.take_journal();
+        assert!(!taken.cut);
+        assert_eq!(ids(&taken), [REVERT]);
+        assert_eq!(apply(&mut author, &taken), 1);
+        assert_eq!(author.doc.plain_text(StoryRef::Body), "ab");
+        assert_eq!(author.doc.plain_text(StoryRef::Body), reader.doc.plain_text(StoryRef::Body));
+    }
+
+    /// Repeat re-runs the last command, so what it journals is that command, not a cut: the
+    /// other session runs the same command and the documents stay together.
+    #[test]
+    fn repeat_sends_the_command_it_repeats() {
+        let mut author = session("");
+        let mut reader = session("");
+        author.run("text.insert", &json!({"text": "a"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+
+        author.run("text.insert", &json!({"text": "b"})).unwrap();
+        assert_eq!(reader.apply_journal(&pairs(&mut author)), 1);
+        author.run("edit.repeat", &json!({})).unwrap();
+        let taken = author.take_journal();
+        assert!(!taken.cut);
+        assert_eq!(ids(&taken), ["text.insert"]);
+        assert_eq!(apply(&mut reader, &taken), 1);
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), "abb");
+        assert_eq!(reader.doc.plain_text(StoryRef::Body), author.doc.plain_text(StoryRef::Body));
+    }
+
+    /// Undo of an edit no journaled command made (a table) has no patch to send. It cuts the log,
+    /// and the host offers the document as the next base, as before.
+    #[test]
+    fn undo_of_an_edit_that_is_not_a_step_cuts_the_log() {
         let mut s = session("");
-        s.run("text.insert", &json!({"text": "a"})).unwrap();
-        s.run("text.insert", &json!({"text": "b"})).unwrap();
+        s.run("insert.table", &json!({"rows": 1, "cols": 1})).unwrap();
+        assert!(s.take_journal().cut, "the table itself is not a step");
         s.run("edit.undo", &json!({})).unwrap();
         let taken = s.take_journal();
-        assert!(taken.cut, "undo is a whole-document snapshot: the log cannot be replayed from its start");
+        assert!(taken.cut, "the table's undo is a whole-document snapshot");
         assert!(taken.steps.is_empty(), "steps inside the new base would apply twice");
         assert!(!s.take_journal().cut, "the host is asked for a base once");
-
-        s.run("edit.redo", &json!({})).unwrap();
-        assert!(s.take_journal().cut);
-
-        s.run("text.insert", &json!({"text": "c"})).unwrap();
-        s.run("edit.repeat", &json!({})).unwrap();
-        assert!(s.take_journal().cut);
     }
 
     #[test]

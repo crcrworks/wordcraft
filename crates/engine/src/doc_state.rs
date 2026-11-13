@@ -129,6 +129,12 @@ pub(super) struct Undo {
     /// The column block or whole cells the selection was (undoing brings the selection back as
     /// it was).
     pub(super) column: Option<ColumnBlock>,
+    // bace: journal; whether Undo sends this step's difference or cuts the log.
+    /// The command that made this step was journaled, and the step's document change is one the
+    /// journal can carry as a patch. Undoing it sends those patches instead of cutting the log
+    /// (`crate::journal::revert`). A step no journaled command made (a table, a picture, a page
+    /// setup change) is false, and Undo cuts the log and asks for a base.
+    pub(super) journaled: bool,
 }
 
 /// The number of edit locations Go Back cycles through (Word: four).

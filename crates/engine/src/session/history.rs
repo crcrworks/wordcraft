@@ -15,6 +15,8 @@ impl Session {
             sel: self.sel.clone(),
             pending: self.pending.clone(),
             column: self.column.clone(),
+            // bace: journal; a checkpoint is the state before a command, not a command.
+            journaled: false,
         }));
         if self.history.len() > MAX_UNDO {
             self.history.remove(0);
@@ -34,7 +36,18 @@ impl Session {
     /// Record `doc`/`sel` as their own undo step after the fact and close the typing group, so
     /// Undo right after an automatic change (AutoFormat, AutoCorrect) reverts only that change.
     pub fn push_undo(&mut self, label: &str, doc: Document, sel: Selection) {
-        self.history.push(Arc::new(Undo { label: label.to_string(), doc, sel, pending: self.pending.clone(), column: None }));
+        // bace: journal; the automatic change (AutoFormat, AutoCorrect) is derived from a
+        // journaled keystroke, so its undo is usually a paragraph patch too. `revert` checks that
+        // it is; a rule that added a table or a picture still falls back to the base.
+        self.history.push(Arc::new(Undo {
+            label: label.to_string(),
+            doc,
+            sel,
+            pending: self.pending.clone(),
+            column: None,
+            // bace: journal; the command that pushed this step was journaled.
+            journaled: true,
+        }));
         if self.history.len() > MAX_UNDO {
             self.history.remove(0);
             self.undo_evicted += 1;
@@ -189,18 +202,39 @@ impl Session {
             c.add_exceptions(&mut self.prefs.autocorrect);
         }
         let Some(u) = self.history.pop().map(Arc::unwrap_or_clone) else { return false };
+        // bace: journal; the difference to send, not the snapshot itself.
+        let journaled = u.journaled;
+        // The difference to send, not the snapshot itself: bace applies it to the other client's
+        // document instead of making this document the log's next base (`journal::revert`).
+        let revert = journaled.then(|| crate::journal::revert(&self.doc, &u.doc)).flatten();
         let cur = Undo {
             label: u.label.clone(),
             doc: std::mem::replace(&mut self.doc, u.doc),
             sel: std::mem::replace(&mut self.sel, u.sel),
             pending: std::mem::replace(&mut self.pending, u.pending),
             column: std::mem::replace(&mut self.column, u.column),
+            journaled,
         };
         self.redo.push(Arc::new(cur));
         // Undo swaps the whole body back: a composition belongs to the text it showed.
         self.note_body_replaced();
         self.refresh_math_session();
         self.touch();
+        // bace: journal; a remote Undo is applied through `apply_journal_revert`, not replayed
+        // back out, so recording it here would echo it.
+        if !self.applying {
+            match revert {
+                Some(params) if params["patches"].as_array().is_some_and(|patches| !patches.is_empty()) => {
+                    self.journal.record_revert(params);
+                }
+                // A step that only changed the pending formatting changed no block: there is
+                // nothing to send, and no base either.
+                Some(_) => {}
+                // A table, an equation, a picture, page setup or another edit no patch
+                // describes: the log cannot be replayed, so the host offers a base.
+                None => self.journal.cut(),
+            }
+        }
         true
     }
 
@@ -215,17 +249,31 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         self.typing_open = false;
         let Some(u) = self.redo.pop().map(Arc::unwrap_or_clone) else { return false };
+        // bace: journal; redo sends the difference between the current document and the snapshot.
+        let journaled = u.journaled;
+        let revert = journaled.then(|| crate::journal::revert(&self.doc, &u.doc)).flatten();
         let cur = Undo {
             label: u.label.clone(),
             doc: std::mem::replace(&mut self.doc, u.doc),
             sel: std::mem::replace(&mut self.sel, u.sel),
             pending: std::mem::replace(&mut self.pending, u.pending),
             column: std::mem::replace(&mut self.column, u.column),
+            journaled,
         };
         self.history.push(Arc::new(cur));
         self.note_body_replaced();
         self.refresh_math_session();
         self.touch();
+        // bace: journal; see `undo`.
+        if !self.applying {
+            match revert {
+                Some(params) if params["patches"].as_array().is_some_and(|patches| !patches.is_empty()) => {
+                    self.journal.record_revert(params);
+                }
+                Some(_) => {}
+                None => self.journal.cut(),
+            }
+        }
         true
     }
 

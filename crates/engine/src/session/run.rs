@@ -1,8 +1,12 @@
-use super::doc_state::{ColumnBlock, Selection};
+// bace: journal; applying a patch is undoable and evicts the oldest step like any other edit.
+use super::doc_state::{ColumnBlock, MAX_UNDO, Selection, Undo};
 use super::ime_state::ImeCaretState;
 use super::snapshot_types::RunSnapshot;
-use super::{CharProps, CmdError, Document, Fragment, ImeEditOutcome, Pos, Session, StoryRef, Value, document_id_mark};
+use super::{CharProps, CmdError, Document, Fragment, ImeEditOutcome, Path, Pos, Session, StoryRef, Value, document_id_mark};
 use crate::CommandSpec;
+// bace: journal; a patch replaces `Arc<Block>` values.
+use std::sync::Arc;
+use wordcraft_doc::Block;
 
 struct SuccessContext<'a> {
     id: &'a str,
@@ -14,6 +18,11 @@ struct SuccessContext<'a> {
     dirty_before: Option<bool>,
     rev_restore: Option<u64>,
     pushed: bool,
+    // bace: journal; the step this command will mark.
+    /// The history step this command is about to change (the checkpoint it pushed, or the step
+    /// a joined command merges into). `finish_success` marks it journaled when the command and
+    /// its document change are both journalable.
+    journal_step: Option<Arc<Undo>>,
     mutates: bool,
     ime_caret_before: ImeCaretState,
     rev_before: u64,
@@ -246,6 +255,9 @@ impl Session {
         {
             self.pending_move = None;
         }
+        // bace: journal; the step this command will make (or join) is the one whose undo the log
+        // can carry as a patch. `finish_success` decides whether this command may mark it.
+        let journal_step = self.history.last().cloned();
         // bace: journal
         let journal_before = JournalBefore {
             sel: self.sel.clone(),
@@ -298,6 +310,7 @@ impl Session {
                 dirty_before,
                 rev_restore,
                 pushed,
+                journal_step,
                 mutates,
                 ime_caret_before,
                 rev_before,
@@ -369,6 +382,7 @@ impl Session {
             dirty_before,
             rev_restore,
             pushed,
+            journal_step,
             mutates,
             ime_caret_before,
             rev_before,
@@ -488,6 +502,18 @@ impl Session {
         }
         self.note_typing(id, before_doc.as_ref().map(|b| &b.0), sel_before);
         self.note_journal(id, params, spec.journal, joins, journal_before); // bace: journal
+        // bace: journal; whether Undo can send this step as patches. A command that joins an
+        // older step may only keep the mark both commands earned.
+        if !no_op
+            && spec.mutates
+            && spec.id != "view.markdownSourceText"
+            && let Some(step) = journal_step
+            && let Some(at) = self.history.iter().position(|history| Arc::ptr_eq(history, &step))
+        {
+            let journaled = spec.journal && !journal_before.blocked && self.document_id == journal_before.document;
+            let step = Arc::make_mut(&mut self.history[at]);
+            step.journaled = if pushed { journaled } else { step.journaled && journaled };
+        }
     }
 
     /// The end of [`Session::run`] for a command that ended up in another document than it
@@ -580,6 +606,13 @@ impl Session {
                 self.apply_journal_state(params);
                 continue;
             }
+            // bace: journal; a difference, not a command to run.
+            if id == crate::journal::REVERT {
+                if self.apply_journal_revert(params) {
+                    applied += 1;
+                }
+                continue;
+            }
             match self.run(id, params) {
                 Ok(_) => applied += 1,
                 Err(error) => log::warn!("a journaled {id} was not applied: {error}"),
@@ -588,6 +621,63 @@ impl Session {
         self.applying = false;
         self.restore_own_state(own);
         applied
+    }
+
+    // bace: journal; applies the block patches a remote Undo or Redo sent.
+    /// Applies the block patches an Undo or Redo sent (`crate::journal::REVERT`).
+    ///
+    /// A patch names a story, a container path, an index and the blocks that replace a range
+    /// there. The session that sent it changed the same blocks, so applying them makes the two
+    /// documents agree without making either one a new base. The person's caret is put back by
+    /// [`Self::restore_own_state`] afterwards, like any other replayed step.
+    fn apply_journal_revert(&mut self, params: &Value) -> bool {
+        let Some(patches) = params.get("patches").and_then(Value::as_array) else { return false };
+        let doc = self.doc.clone();
+        let sel = self.sel.clone();
+        let pending = self.pending.clone();
+        let column = self.column.clone();
+        let mut changed = false;
+        for patch in patches {
+            let (Some(story), Some(path), Some(at), Some(remove), Some(blocks)) = (
+                patch.get("story").and_then(|story| serde_json::from_value::<StoryRef>(story.clone()).ok()),
+                patch
+                    .get("path")
+                    .and_then(Value::as_array)
+                    .map(|path| path.iter().filter_map(Value::as_u64).map(|index| index as u32).collect::<Vec<_>>()),
+                patch.get("at").and_then(Value::as_u64).map(|at| at as usize),
+                patch.get("remove").and_then(Value::as_u64).map(|remove| remove as usize),
+                patch.get("blocks").and_then(|blocks| serde_json::from_value::<Vec<Arc<Block>>>(blocks.clone()).ok()),
+            ) else {
+                continue;
+            };
+            let mut container = path;
+            // `container_mut` reads the parent of the path, so any index works as the last one.
+            container.push(0);
+            let Ok(blocks_at) = self.doc.container_mut(story, &Path(container)) else { continue };
+            let Some(end) = at.checked_add(remove) else { continue };
+            if end > blocks_at.len() {
+                continue;
+            }
+            blocks_at.splice(at..end, blocks);
+            changed = true;
+        }
+        if changed {
+            self.doc.ensure_nonempty();
+            // The remote change is one step in this session's history too, so its Undo takes the
+            // remote Undo back (and sends the inverse as another patch). Without this, the
+            // person's ⌘Z would step over a change their document shows.
+            self.history.push(Arc::new(Undo { label: "Undo".to_string(), doc, sel, pending, column, journaled: true }));
+            if self.history.len() > MAX_UNDO {
+                self.history.remove(0);
+                self.undo_evicted += 1;
+            }
+            self.redo.clear();
+            self.typing_open = false;
+            self.join_anchor = true;
+            self.note_body_replaced();
+            self.touch();
+        }
+        changed
     }
 
     /// The state the person here is editing with, which replaying another session's steps must
@@ -647,6 +737,13 @@ impl Session {
     fn note_journal(&mut self, id: &str, params: &Value, journaled: bool, joins: crate::journal::Joins, before: &JournalBefore) {
         // A step another session sent is replayed here: it is not journaled in turn.
         if self.applying {
+            return;
+        }
+        // bace: journal; Undo, Undo To and Redo record their own difference
+        // (`Session::undo` / `redo`, `crate::journal::record_revert`), or cut the log when it is
+        // not one they can carry. Repeat re-runs its command, which is recorded below; recording
+        // the wrapper too would duplicate that command.
+        if matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo" | "edit.repeat") {
             return;
         }
         // A command that changed nothing (a read, a view toggle, a dialog) is not an edit.

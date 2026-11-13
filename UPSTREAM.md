@@ -40,7 +40,9 @@ fork。bace（[`crcrworks/bace`](https://github.com/crcrworks/bace)）が LiveWi
 | `crates/engine/src/lib.rs` | `CommandSpec` に `journal` を足し、モジュールを公開するフック | 4 |
 | `crates/engine/src/cmd.rs` | テキスト・書式・段落の編集コマンドを journal 対象にするフック（上流が `cmd/mod.rs` から改名） | 4 |
 | `crates/engine/src/session.rs` | `Session` に `journal` / `applying` を持つ | 1 |
-| `crates/engine/src/session/run.rs` | `run` の成功時に journal へ記録するフック、別の文書へ移ったコマンドでログを切るフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 9 |
+| `crates/engine/src/doc_state.rs` | `Undo` に、そのステップを差分として送れるかを持つ | 1 |
+| `crates/engine/src/session/history.rs` | ステップの journal 印と、undo / redo が差分（`journal.revert`）を記録するフック | 7 |
+| `crates/engine/src/session/run.rs` | `run` の成功時に journal へ記録するフック、差分の適用、別の文書へ移ったコマンドでログを切るフックと、`take_journal` / `skip_journal` / `apply_journal` の入口 | 17 |
 | `crates/engine/src/session/snapshot.rs` | `edit_snapshot` / `restore` で記録を巻き戻すフック | 3 |
 | `crates/engine/src/session/documents.rs` | 文書を切り替えたらログを切るフック（ログは表示中の文書のもの） | 2 |
 | `crates/engine/src/session/lifecycle.rs` | `Session::new` の初期化 | 1 |
@@ -54,7 +56,9 @@ git grep -c '// bace:'
 ```
 
 `fab8793c`（egui 0.37）を取り込んだ時点の差は 9 ファイル・+690/−5、`// bace:` は 25 個。
-うち `crates/engine/src/session/*` の 16 個は、上流の `session.rs` 分割にフックを付け直したもの:
+うち `crates/engine/src/session/*` の 16 個は、上流の `session.rs` 分割にフックを付け直したもの。
+undo/redo を差分で送る変更（`0046`）の後は 11 ファイル・+1139/−8、`// bace:` は 41 個
+（`session/*` は 30 個）。:
 
 ```bash
 git diff fab8793ce791763761353b78caad6a63a46e5b01 bace --stat -- . ':!UPSTREAM.md'
